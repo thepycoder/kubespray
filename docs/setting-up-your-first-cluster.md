@@ -25,6 +25,7 @@ hands-on guide to get started with Kubespray.
 * The [kubectl](https://kubernetes.io/docs/tasks/tools/install-kubectl/) command line utility is used to interact with the Kubernetes
  API Server.
 * Linux or Mac environment with Python 3
+* Ansible ([installation instructions](https://docs.ansible.com/ansible/latest/installation_guide/intro_installation.html))
 
 ## Provisioning Compute Resources
 
@@ -48,7 +49,7 @@ gcloud compute networks create kubernetes-the-kubespray-way --subnet-mode custom
 
 A [subnet](https://cloud.google.com/compute/docs/vpc/#vpc_networks_and_subnets) must be provisioned with an IP address range large enough to assign a private IP address to each node in the Kubernetes cluster.
 
-Create the `kubernetes` subnet in the `kubernetes-the-hard-way` VPC network:
+Create the `kubernetes` subnet in the `kubernetes-the-kubespray-way` VPC network:
 
 ```ShellSession
 gcloud compute networks subnets create kubernetes \
@@ -159,6 +160,18 @@ worker-2      us-west1-c  e2-standard-2               10.240.0.22  XX.XXX.XX.XX 
 
 Kubespray is relying on SSH to configure the controller and worker instances.
 
+If you do not have an ssh key yet, you can generate one by running
+```ShellSession
+ssh-keygen -t rsa -f ~/.ssh/[KEY_FILENAME] -C [USERNAME]
+```
+where:
+
+`[KEY_FILENAME]` is the name that you want to use for your SSH key files. For example, a filename of my-ssh-key generates a private key file named my-ssh-key and a public key file named my-ssh-key.pub.
+
+`[USERNAME]` is the username for the user connecting to the instance.
+
+The next step is to add your own public key (usually located at `~/.ssh/[KEY_FILENAME].pub`) to the VMs by using the google cloud console or the gcloud command tool. The instructions can be found [here](https://cloud.google.com/compute/docs/instances/adding-removing-ssh-keys#project-wide).
+
 Test SSH access to the `controller-0` compute instance:
 
 ```ShellSession
@@ -167,13 +180,13 @@ USERNAME=$(whoami)
 ssh $USERNAME@$IP_CONTROLLER_0
 ```
 
-If this is your first time connecting to a compute instance SSH keys will be
-generated for you. In this case you will need to enter a passphrase at the
-prompt to continue.
-
 > If you get a 'Remote host identification changed!' warning, you probably
 already connected to that IP address in the past with another host key. You
 can remove the old host key by running `ssh-keygen -R $IP_CONTROLLER_0`
+
+> If you get a `[USERNAME]@[IP_CONTROLLER_0]: Permission denied (publickey).` like error
+and can't connect to the instance, it means you have not added your ssh properly to the project on GCP.
+Check above on how to do that.
 
 Please repeat this procedure for all the controller and worker nodes, to
 ensure that SSH access is properly functioning for all nodes.
@@ -216,17 +229,68 @@ Update Ansible inventory file with inventory builder:
 
 ```ShellSession
 declare -a IPS=($(gcloud compute instances list --filter="tags.items=kubernetes-the-kubespray-way" --format="value(EXTERNAL_IP)"  | tr '\n' ' '))
-CONFIG_FILE=inventory/mycluster/hosts.yaml python3 contrib/inventory_builder/inventory.py ${IPS[@]}
+
+CONFIG_FILE=inventory/mycluster/hosts.yaml
+
+python3 contrib/inventory_builder/inventory.py ${IPS[@]}
 ```
 
 Open the generated `inventory/mycluster/hosts.yaml` file and adjust it so
-that controller-0, controller-1 and controller-2 are control plane nodes and
-worker-0, worker-1 and worker-2 are worker nodes. Also update the `ip` to the respective local VPC IP and
-remove the `access_ip`.
+that controller-0, controller-1 and controller-2 are control plane nodes (kube-master) and
+worker-0, worker-1 and worker-2 are worker nodes (kube-node). Also update the `ip` to the respective local VPC IPs and
+remove all instances of `access_ip`.
+
+Your file should look something like this:
+```
+all:
+  hosts:
+    controller-0:
+      ansible_host: <controller-0-external-ip>
+      ip: 10.240.0.10
+    controller-1:
+      ansible_host: <controller-1-external-ip>
+      ip: 10.240.0.11
+    controller-2:
+      ansible_host: <controller-2-external-ip>
+      ip: 10.240.0.12
+    worker-0:
+      ansible_host: <worker-0-external-ip>
+      ip: 10.240.0.20
+    worker-1:
+      ansible_host: <worker-1-external-ip>
+      ip: 10.240.0.21
+    worker-2:
+      ansible_host: <worker-2-external-ip>
+      ip: 10.240.0.22
+  children:
+    kube-master:
+      hosts:
+        controller-0:
+        controller-1:
+        controller-2:
+    kube-node:
+      hosts:
+        worker-0:
+        worker-1:
+        worker-2:
+    etcd:
+      hosts:
+        controller-0:
+        controller-1:
+        controller-2:
+    k8s-cluster:
+      children:
+        kube-master:
+        kube-node:
+    calico-rr:
+      hosts: {}
+```
+
+Where the `10.240.x.x` IPs are the IPs of the VMs within their VPC network, if you did everything the same as in this guide, they will already be correct.
 
 The main configuration for the cluster is stored in
 `inventory/mycluster/group_vars/k8s-cluster/k8s-cluster.yml`. In this file we
- will update the `supplementary_addresses_in_ssl_keys` with a list of the IP
+ will update the `supplementary_addresses_in_ssl_keys` with a list of the external IP
  addresses of the controller nodes. In that way we can access the
   kubernetes API server as an administrator from outside the VPC network. You
    can also see that the `kube_network_plugin` is by default set to 'calico'.
@@ -254,7 +318,7 @@ We will leverage a kubeconfig file from one of the controller nodes to access
 
 > In this simplified set-up, we did not include a load balancer that usually
  sits on top of the
-three controller nodes for a high available API server endpoint. In this
+ three controller nodes for a highly available API server endpoint. In this
  simplified tutorial we connect directly to one of the three
  controllers.
 
@@ -277,7 +341,7 @@ scp $USERNAME@$IP_CONTROLLER_0:/etc/kubernetes/admin.conf kubespray-do.conf
 This kubeconfig file uses the internal IP address of the controller node to
 access the API server. This kubeconfig file will thus not work of from
 outside of the VPC network. We will need to change the API server IP address
-to the controller node his external IP address. The external IP address will be
+to the controller node's external IP address. The external IP address will be
 accepted in the
 TLS negotation as we added the controllers external IP addresses in the SSL
 certificate configuration.
@@ -356,6 +420,9 @@ hostname -i
 # launch myshell2 in seperate terminal (see next code block) and ping the hostname of myshell2
 ping <hostname myshell2>
 ```
+
+>Don't forget to run the `export KUBECONFIG=$PWD/kubespray-do.conf` again in the new shell!
+Or better yet, add it to your `~/.bashrc`
 
 ```ShellSession
 kubectl run myshell2 -it --rm --image busybox -- sh
@@ -589,7 +656,7 @@ Delete the dev namespace, the nginx deployment and service:
 ```ShellSession
 kubectl delete namespace dev
 kubectl delete deployment nginx
-kubectl delete svc/ngninx
+kubectl delete svc/nginx
 ```
 
 ### Kubernetes state
